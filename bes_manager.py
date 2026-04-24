@@ -41,38 +41,46 @@ def _get_roblox_pid_map() -> dict[int, int]:
     return result
 
 
-def _get_exempt_pids(exempt_accounts, pid_hwnd_map):
-    """Return the set of PIDs whose account name is in exempt_accounts."""
+def _get_exempt_pids(exempt_accounts, pid_hwnd_map, name_cache):
+    """Return the set of PIDs whose account name is in exempt_accounts.
+
+    Uses the pre-built name_cache {pid: name} instead of calling
+    resolve_account_for_window per PID.
+    """
     if not exempt_accounts:
         return set()
 
-    try:
-        settings = load_settings()
-        tracked = list(settings.get("players", {}).keys())
-        exempt_pids = set()
-
-        for pid, hwnd in pid_hwnd_map.items():
-            name = window_utils.resolve_account_for_window(hwnd, tracked)
-            if name and name in exempt_accounts:
-                exempt_pids.add(pid)
-
-        return exempt_pids
-    except Exception:
-        return set()
+    exempt_set = set(exempt_accounts)
+    return {pid for pid, name in name_cache.items() if name and name in exempt_set}
 
 
 # ----------------------------------------------------------------
 # Internal BES loop (drives the controller)
 # ----------------------------------------------------------------
+# How often (seconds) to re-resolve which account owns each window.
+# This is expensive (reads log files) so we do it infrequently.
+_NAME_RESOLVE_INTERVAL = 10.0
+
+
 def _bes_loop():
     global bes_running, _controller
 
     if _controller is None:
-        # Log via print as a fallback if signals not ready
         return
 
     signals.log_message.emit("[BES] CPU throttler started")
     _controller.set_enabled(True)
+
+    # Track when each PID was first seen so we can apply a startup grace period.
+    # New Roblox instances need time to connect before being throttled — suspending
+    # threads during the join/loading phase causes disconnects.
+    _pid_first_seen: dict[int, float] = {}
+
+    # Cached name resolution: {pid: account_name_or_None}
+    # Re-populated every _NAME_RESOLVE_INTERVAL seconds using the efficient
+    # batch function instead of per-PID resolve_account_for_window calls.
+    _name_cache: dict[int, str | None] = {}
+    _last_name_resolve: float = 0.0
 
     try:
         while bes_running:
@@ -83,6 +91,10 @@ def _bes_loop():
             cpu_limit = max(1, min(99, int(cfg.get("cpu_limit", 50))))
             reduce_pct = max(0, min(99, 100 - cpu_limit))
 
+            # Grace period (seconds) before throttling a newly launched Roblox instance.
+            # Keeps BES from suspending threads while the game is still connecting.
+            grace_seconds = max(0, int(cfg.get("new_window_grace_seconds", 30)))
+
             # Base cycle for the controller (it will auto-scale as needed)
             cycle_ms = max(10, int(cfg.get("cycle_ms", 20)))
             _controller.set_cycle_ms(cycle_ms)
@@ -90,7 +102,45 @@ def _bes_loop():
             exempt_accts = cfg.get("exempt_accounts", []) or []
 
             pid_map = _get_roblox_pid_map()
-            exempt_pids = _get_exempt_pids(exempt_accts, pid_map)
+
+            now = time.time()
+
+            # Record first-seen time for any new PIDs.
+            for pid in pid_map:
+                if pid not in _pid_first_seen:
+                    _pid_first_seen[pid] = now
+
+            # Drop stale entries for PIDs that no longer exist.
+            for pid in list(_pid_first_seen):
+                if pid not in pid_map:
+                    _pid_first_seen.pop(pid, None)
+
+            # ── Name resolution (expensive, so batched + cached) ──────────
+            # Only re-resolve when the timer expires OR new PIDs appeared
+            # that aren't in the cache yet.
+            new_pids_unseen = any(pid not in _name_cache for pid in pid_map)
+            if new_pids_unseen or (now - _last_name_resolve >= _NAME_RESOLVE_INTERVAL):
+                try:
+                    tracked = list(settings.get("players", {}).keys())
+                    hwnds = list(pid_map.values())
+                    if hwnds and tracked:
+                        hwnd_names = window_utils.resolve_accounts_for_windows(hwnds, tracked)
+                        # Rebuild cache as {pid: name}
+                        _name_cache.clear()
+                        for pid, hwnd in pid_map.items():
+                            _name_cache[pid] = hwnd_names.get(hwnd)
+                    else:
+                        _name_cache.clear()
+                except Exception:
+                    pass
+                _last_name_resolve = now
+
+            # Purge cache entries for PIDs that are gone.
+            for pid in list(_name_cache):
+                if pid not in pid_map:
+                    _name_cache.pop(pid, None)
+
+            exempt_pids = _get_exempt_pids(exempt_accts, pid_map, _name_cache)
 
             # Build PID -> reduction percent map (global limit, per-process application)
             target_pcts: dict[int, int] = {}
@@ -100,16 +150,15 @@ def _bes_loop():
                 for pid, hwnd in pid_map.items():
                     if pid in exempt_pids:
                         continue
-                    target_pcts[pid] = reduce_pct
 
-                    # Optional: try to resolve a friendly name for logging/UI
-                    try:
-                        settings = load_settings()
-                        tracked = list(settings.get("players", {}).keys())
-                        name = window_utils.resolve_account_for_window(hwnd, tracked) or f"PID {pid}"
-                    except Exception:
-                        name = f"PID {pid}"
-                    names[pid] = name
+                    # Skip PIDs that are still within the startup grace period.
+                    age = now - _pid_first_seen.get(pid, now)
+                    if age < grace_seconds:
+                        _controller.hold_unthrottled(pid, grace_seconds - age)
+                        continue
+
+                    target_pcts[pid] = reduce_pct
+                    names[pid] = _name_cache.get(pid) or f"PID {pid}"
 
             _controller.apply(target_pcts, names=names)
 

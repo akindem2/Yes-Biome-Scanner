@@ -1,4 +1,4 @@
-﻿altgraph==0.17.5
+altgraph==0.17.5
 certifi==2026.2.25
 charset-normalizer==3.4.7
 convcolors==2.2.0
@@ -7,14 +7,12 @@ flatbuffers==25.12.19
 idna==3.11
 mpmath==1.3.0
 numpy==2.4.4
-onnxruntime==1.24.4
 opencv-python==4.13.0.92
 packaging==26.1
 pefile==2024.8.26
 pillow==12.2.0
 protobuf==7.34.1
 psutil==7.2.2
-pyclipper==1.4.0
 PyDirectInput==1.0.4
 pyinstaller==6.19.0
 pyinstaller-hooks-contrib==2026.4
@@ -27,10 +25,12 @@ pywin32==311
 pywin32-ctypes==0.2.3
 PyYAML==6.0.3
 RapidFuzz==3.14.5
-rapidocr-onnxruntime==1.2.3
+winrt-runtime
+winrt-Windows.Media.Ocr
+winrt-Windows.Graphics.Imaging
+winrt-Windows.Storage.Streams
 requests==2.33.1
 setuptools==82.0.1
-shapely==2.1.2
 six==1.17.0
 sympy==1.14.0
 urllib3==2.6.3

@@ -303,6 +303,7 @@ class TrimmerTab(QWidget):
         self.log_box = QTextEdit()
         self.log_box.setReadOnly(True)
         self.log_box.setFont(QFont("Consolas", 10))
+        self.log_box.document().setMaximumBlockCount(500)
         self.log_box.setMinimumHeight(200)
         log_layout.addWidget(self.log_box)
         layout.addWidget(log_group)

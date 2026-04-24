@@ -23,10 +23,14 @@ def is_log_active(filepath, max_age_seconds=120):
     """
     try:
         mtime = os.path.getmtime(filepath)
-        if time.time() - mtime < max_age_seconds:
+        age = time.time() - mtime
+        if age < max_age_seconds:
             return True
+        # Optimization: Don't check file lock if older than 2 hours to save I/O
+        if age > 7200:
+            return False
     except OSError:
-        pass
+        return False
 
     # Legacy fallback: check if file is locked
     try:
@@ -39,19 +43,30 @@ def is_log_active(filepath, max_age_seconds=120):
         return False
 
 def _list_detection_logs(log_path):
-    """Return candidate log files for player and biome detection."""
+    """Return the most recent candidate log files for player and biome detection."""
     try:
-        return[
-            os.path.join(log_path, f)
-            for f in os.listdir(log_path)
-            if f.endswith((".log", ".logs"))
-        ]
+        entries = []
+        for entry in os.scandir(log_path):
+            if entry.is_file() and entry.name.endswith((".log", ".logs")):
+                try:
+                    entries.append((entry.path, entry.stat().st_mtime))
+                except OSError:
+                    pass
+        entries.sort(key=lambda x: x[1], reverse=True)
+        return [path for path, _ in entries[:50]]
     except FileNotFoundError:
-        return[]
+        return []
 
 def _list_cleanup_logs(log_path):
     """Return log files that cleanup is still allowed to delete."""
-    return[path for path in _list_detection_logs(log_path) if path not in _failed_deletions]
+    all_logs = []
+    try:
+        for entry in os.scandir(log_path):
+            if entry.is_file() and entry.name.endswith((".log", ".logs")):
+                all_logs.append(entry.path)
+    except FileNotFoundError:
+        pass
+    return [path for path in all_logs if path not in _failed_deletions]
 
 # Tracks log files that have already failed to delete — never retried for cleanup again
 _failed_deletions = set()

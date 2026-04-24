@@ -70,6 +70,7 @@ _KEYEVENTF_UNICODE       = 0x0004
 _VK_CONTROL = 0x11
 _VK_A       = 0x41
 _VK_V       = 0x56
+_VK_RETURN  = 0x0D
 
 _user32 = ctypes.WinDLL("user32", use_last_error=True)
 _SM_CXSCREEN = 0
@@ -890,6 +891,16 @@ def _send_typed_text(text: str) -> None:
         pass
 
 
+def _send_enter() -> None:
+    try:
+        _send_input(
+            _make_key_input(_VK_RETURN),
+            _make_key_input(_VK_RETURN, up=True),
+        )
+    except Exception:
+        pass
+
+
 def _auto_item_mouse_block_tooltip(show: bool) -> None:
     """
     On-screen tooltip while physical mouse movement is blocked.
@@ -1326,9 +1337,12 @@ class AutoItemEngine:
 
                 # Amount box
                 _click("amount_box")
+                _click("amount_box")
                 _send_ctrl_a()
                 time.sleep(0.02)
                 _send_typed_text(str(max(1, int(rule.amount))))
+                time.sleep(0.02)
+                _send_enter()
                 time.sleep(max(0.05, float(click_delay)))
 
                 # Use

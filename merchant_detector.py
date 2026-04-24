@@ -59,10 +59,14 @@ def is_log_active(filepath, max_age_seconds=120):
     """Check if a log file is from an active Roblox session."""
     try:
         mtime = os.path.getmtime(filepath)
-        if time.time() - mtime < max_age_seconds:
+        age = time.time() - mtime
+        if age < max_age_seconds:
             return True
+        # Optimization: Don't check file lock if older than 2 hours to save I/O
+        if age > 7200:
+            return False
     except OSError:
-        pass
+        return False
 
     # Legacy fallback: check if file is locked
     try:
@@ -78,11 +82,15 @@ def is_log_active(filepath, max_age_seconds=120):
 def _list_detection_logs(log_path):
     """Return candidate log files for player detection."""
     try:
-        return [
-            os.path.join(log_path, f)
-            for f in os.listdir(log_path)
-            if f.endswith((".log", ".logs"))
-        ]
+        entries = []
+        for entry in os.scandir(log_path):
+            if entry.is_file() and entry.name.endswith((".log", ".logs")):
+                try:
+                    entries.append((entry.path, entry.stat().st_mtime))
+                except OSError:
+                    pass
+        entries.sort(key=lambda x: x[1], reverse=True)
+        return [path for path, _ in entries[:50]]
     except FileNotFoundError:
         return []
 

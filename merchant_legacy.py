@@ -6,8 +6,11 @@ Primary detection: log file asset ID scanning (adapted from J.JARAM).
   - Cheap string prefilter before regex, runs on already-open log files.
 
 Fallback detection: OCR on Roblox window chat region.
+  Uses the built-in Windows.Media.Ocr engine (no onnxruntime / RapidOCR needed).
+  Requires: pip install winrt-Windows.Media.Ocr
 """
 
+import asyncio
 import io
 import os
 import re
@@ -21,7 +24,6 @@ from typing import Dict, Optional
 from PIL import Image
 import win32gui
 import win32ui
-import numpy as np
 from rapidfuzz import fuzz
 
 import window_utils
@@ -31,8 +33,9 @@ from webhook import send_merchant_detected_message
 signals = None
 merchant_detector_running = False
 
-_rapid_ocr_engine = None
+_ocr_engine = None
 _ocr_backend_name = None
+_ocr_thread_id = None
 
 DEFAULT_MERCHANTS = []
 
@@ -54,6 +57,14 @@ MERCHANT_KNOWN_COLORS = {
 # Maximum Euclidean RGB distance for a color to be accepted.
 # Color is a hard requirement — no match means no detection.
 COLOR_MAX_EUCLIDEAN = 45
+
+def _init_ocr_thread_context():
+    """Initialise COM for the current worker thread before using WinRT OCR."""
+    try:
+        import pythoncom
+        pythoncom.CoInitialize()
+    except Exception:
+        pass
 
 def _capture_window(hwnd):
     try:
@@ -79,7 +90,6 @@ def _capture_window(hwnd):
             (bmpinfo["bmWidth"], bmpinfo["bmHeight"]),
             bmpstr, "raw", "BGRX", 0, 1
         )
-
         win32gui.DeleteObject(bmp.GetHandle())
         memdc.DeleteDC()
         srcdc.DeleteDC()
@@ -186,6 +196,33 @@ def _matches_merchant(line_text, merchant):
         return True
     return fuzz.ratio(msg, text) >= FUZZ_THRESHOLD
 
+def _find_matching_merchant(line_text, line_image, merchants):
+    """
+    Return (merchant, detected_color) only when a configured merchant matches
+    both the OCR text and the expected chat-text color for that merchant.
+    """
+    if not line_text or not merchants:
+        return None, None
+
+    for merchant in merchants:
+        merchant_name = str(merchant.get("name", "")).strip()
+        if not merchant_name:
+            continue
+        if not _matches_merchant(line_text, merchant):
+            continue
+
+        expected_rgb = MERCHANT_KNOWN_COLORS.get(merchant_name.lower())
+        if expected_rgb is None:
+            continue
+
+        color_matches, detected_color = _extract_text_color(line_image, expected_rgb)
+        if not color_matches:
+            continue
+
+        return merchant, detected_color
+
+    return None, None
+
 def _clamp_box(box, image):
     if not box:
         return None
@@ -198,24 +235,94 @@ def _clamp_box(box, image):
     return left, top, right, bottom
 
 def _ensure_ocr_backend():
-    global _rapid_ocr_engine, _ocr_backend_name
-    if _rapid_ocr_engine is not None:
+    """Initialise the Windows.Media.Ocr engine (requires winrt)."""
+    global _ocr_engine, _ocr_backend_name, _ocr_thread_id
+    current_thread_id = threading.get_ident()
+    if _ocr_engine is not None and _ocr_thread_id == current_thread_id:
         return
-    from rapidocr_onnxruntime import RapidOCR
-    _rapid_ocr_engine = RapidOCR()
-    _ocr_backend_name = "rapidocr"
+    import winrt.windows.media.ocr as _ocr_mod
+    engine = _ocr_mod.OcrEngine.try_create_from_user_profile_languages()
+    if engine is None:
+        raise RuntimeError(
+            "Windows.Media.Ocr: no language pack found. "
+            "Install the English (or your system) OCR language pack from Windows Settings."
+        )
+    _ocr_engine = engine
+    _ocr_backend_name = "windows_media_ocr"
+    _ocr_thread_id = current_thread_id
 
-def _run_ocr(image):
-    if _rapid_ocr_engine is None:
-        return[]
-    arr    = np.asarray(image.convert("RGB"))
-    result = _rapid_ocr_engine(arr)
-    lines  = []
-    if result and result[0]:
-        for item in result[0]:
-            box, text, *_ = item
-            if text:
-                lines.append({"text": text, "box": box})
+
+async def _winrt_recognize(engine, image: Image.Image):
+    """Convert a PIL image to SoftwareBitmap and run WinRT OCR."""
+    import winrt.windows.graphics.imaging as _img
+    import winrt.windows.storage.streams as _streams
+
+    # OcrEngine requires BGRA8; convert and grab raw bytes
+    rgba = image.convert("RGBA")
+    r, g, b, a = rgba.split()
+    bgra = Image.merge("RGBA", (b, g, r, a))
+    width, height = bgra.size
+    raw_bytes = bgra.tobytes()
+
+    # Pack bytes into a WinRT IBuffer via DataWriter
+    writer = _streams.DataWriter()
+    writer.write_bytes(raw_bytes)
+    buf = writer.detach_buffer()
+
+    bitmap = _img.SoftwareBitmap.create_copy_from_buffer(
+        buf,
+        _img.BitmapPixelFormat.BGRA8,
+        width,
+        height,
+    )
+
+    result = await engine.recognize_async(bitmap)
+    return result
+
+
+def _run_ocr(image: Image.Image):
+    """Run Windows.Media.Ocr and return [{text, box}] lines.
+
+    The WinRT engine returns word-level bounding rectangles.
+    We reassemble them into per-line results with a synthetic bounding box
+    so the rest of the detection pipeline is unchanged.
+    """
+    if _ocr_engine is None or _ocr_thread_id != threading.get_ident():
+        try:
+            _init_ocr_thread_context()
+            _ensure_ocr_backend()
+        except Exception as exc:
+            if signals:
+                signals.log_message.emit(f"[MERCHANT] OCR backend init failed: {exc}")
+            return []
+    try:
+        result = asyncio.run(_winrt_recognize(_ocr_engine, image))
+    except Exception as exc:
+        if signals:
+            signals.log_message.emit(f"[MERCHANT] WinRT OCR execution failed: {exc}")
+        return []
+    lines = []
+    for line in result.lines:
+        text = line.text
+        if not text:
+            continue
+        # Build a simple bounding box from the line's word rectangles
+        xs, ys = [], []
+        for word in line.words:
+            r = word.bounding_rect
+            xs += [r.x, r.x + r.width]
+            ys += [r.y, r.y + r.height]
+        if not xs:
+            continue
+        box = [
+            [min(xs), min(ys)],
+            [max(xs), min(ys)],
+            [max(xs), max(ys)],
+            [min(xs), max(ys)],
+        ]
+        lines.append({"text": text, "box": box})
+    if signals and not lines:
+        signals.log_message.emit("[MERCHANT] OCR processed screenshot but found 0 text lines")
     return lines
 
 def _scan_window_ocr(hwnd, merchants, account_name=None):
@@ -259,52 +366,57 @@ def _scan_window_ocr(hwnd, merchants, account_name=None):
             continue
         line_image = chat_image.crop(clamped)
 
-        for merchant in merchants:
-            # Use the hardcoded known color for this merchant — not the config hex.
-            # Color is a hard requirement: both text AND color must match.
-            expected_rgb = MERCHANT_KNOWN_COLORS.get(merchant["name"].lower())
-            color_matches, detected_color = _extract_text_color(line_image, expected_rgb)
-            if not color_matches:
-                continue
-            if not _matches_merchant(line_text, merchant):
-                continue
+        merchant, detected_color = _find_matching_merchant(line_text, line_image, merchants)
+        if merchant is None:
+            continue
 
-            merchant_key = merchant["name"].lower()
-            now          = time.time()
-            _window_cooldowns.setdefault(hwnd, {})
-            if now - _window_cooldowns[hwnd].get(merchant_key, 0) < WINDOW_COOLDOWN:
-                continue
+        merchant_key = merchant["name"].lower()
+        now          = time.time()
+        _window_cooldowns.setdefault(hwnd, {})
+        if now - _window_cooldowns[hwnd].get(merchant_key, 0) < WINDOW_COOLDOWN:
+            continue
 
-            for m in merchants:
-                _window_cooldowns[hwnd][m["name"].lower()] = now
+        for m in merchants:
+            merchant_name = str(m.get("name", "")).strip().lower()
+            if merchant_name:
+                _window_cooldowns[hwnd][merchant_name] = now
 
-            account_label = account_name or "Unknown account"
-            if signals:
-                signals.log_message.emit(
-                    f"[MERCHANT] {merchant['name']} detected (OCR) for {account_label}: {line_text}"
-                )
-
-            img_bytes = io.BytesIO()
-            chat_image.save(img_bytes, format="PNG")
-
-            send_merchant_detected_message(
-                merchant["name"],
-                merchant["message"],
-                merchant.get("color", ""),
-                merchant.get("role_id", ""),
-                account_name,
-                line_text,
-                detected_color,
-                img_bytes.getvalue(),
+        account_label = account_name or "Unknown account"
+        if signals:
+            signals.log_message.emit(
+                f"[MERCHANT] {merchant['name']} detected (OCR) for {account_label}: {line_text}"
             )
+
+        img_bytes = io.BytesIO()
+        chat_image.save(img_bytes, format="PNG")
+
+        send_merchant_detected_message(
+            merchant["name"],
+            merchant["message"],
+            merchant.get("color", ""),
+            merchant.get("role_id", ""),
+            account_name,
+            line_text,
+            detected_color,
+            img_bytes.getvalue(),
+        )
 
 def merchant_detector_loop():
     global merchant_detector_running
 
+    try:
+        _init_ocr_thread_context()
+        _ensure_ocr_backend()
+    except Exception as exc:
+        merchant_detector_running = False
+        if signals:
+            signals.log_message.emit(f"[ERROR] Merchant detector OCR worker failed: {exc}")
+        return
+
     runtime = _load_runtime_settings()
     if signals:
         signals.log_message.emit(
-            f"[START] OCR Merchant detector running — interval: {runtime['scan_interval']}s"
+            f"[START] OCR Merchant detector running ({_ocr_backend_name}) — interval: {runtime['scan_interval']}s"
         )
 
     while merchant_detector_running:
@@ -336,13 +448,6 @@ def start_merchant_detector(mode=""):
     if mode != "OCR":
         return
     if merchant_detector_running:
-        return
-
-    try:
-        _ensure_ocr_backend()
-    except Exception as exc:
-        if signals:
-            signals.log_message.emit(f"[ERROR] Merchant detector could not start: {exc}")
         return
 
     merchant_detector_running = True

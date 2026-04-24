@@ -1014,6 +1014,7 @@ class BiomeScannerUI(QWidget):
 
         self.log_box = QTextEdit()
         self.log_box.setReadOnly(True)
+        self.log_box.document().setMaximumBlockCount(500)
         root.addWidget(self.log_box, 1)
 
         from trimmer import TrimmerTab
@@ -1200,14 +1201,6 @@ class BiomeScannerUI(QWidget):
         cursor.insertText(text + "\n", fmt)
         self.log_box.setTextCursor(cursor)
         self.log_box.ensureCursorVisible()
-        # Trim to 500 lines
-        doc = self.log_box.document()
-        while doc.blockCount() > 500:
-            cursor = QTextCursor(doc.begin())
-            cursor.select(QTextCursor.SelectionType.BlockUnderCursor)
-            cursor.movePosition(QTextCursor.MoveOperation.NextCharacter,
-                                QTextCursor.MoveMode.KeepAnchor)
-            cursor.removeSelectedText()
 
     def open_settings(self):
         self.settings_window = SettingsWindow(self)
