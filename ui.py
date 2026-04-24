@@ -826,11 +826,7 @@ class AccountOverviewPanel(QWidget):
         """Check which accounts have an active Roblox window and update outlines."""
         try:
             import window_utils
-            active_names = set()
-            for hwnd in window_utils.get_roblox_windows():
-                name = window_utils.resolve_account_for_window(hwnd, list(self._cards.keys()))
-                if name:
-                    active_names.add(name)
+            active_names = set(window_utils.get_active_account_hwnds(list(self._cards.keys())).keys())
         except Exception:
             active_names = set()
 

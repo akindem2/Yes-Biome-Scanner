@@ -3,7 +3,6 @@ import re
 import time
 import threading
 import subprocess
-import win32process
 from settings_manager import load_settings, mark_cookie_invalid
 import roblox_launcher
 import window_utils
@@ -11,7 +10,7 @@ import window_utils
 signals = None
 auto_launch_running = False
 
-# ── Disconnect detection patterns (from J.JARAM log_utils.py) ────────────────
+# Disconnect detection patterns (from J.JARAM log_utils.py)
 # These only match real network disconnects inside [FLog::Network] lines,
 # avoiding false positives from roblox::datamodel::close which fires on every
 # clean shutdown and was causing infinite relaunch loops.
@@ -21,7 +20,7 @@ _R_DISC_SENDING = re.compile(r"\[FLog::Network\]\s+Sending disconnect with reaso
 _R_CONN_LOST    = re.compile(r"\[FLog::Network\]\s+Connection lost", re.I)
 
 # How many bytes to read from the end of the log for disconnect scanning
-_DISCONNECT_READ_BYTES = 32_768  # 32 KB — enough for recent log tail, fast to read
+_DISCONNECT_READ_BYTES = 32_768  # 32 KB - enough for recent log tail, fast to read
 
 
 def init(sig):
@@ -56,80 +55,14 @@ def is_disconnected(log_path):
         return False
 
 
-def _is_log_active(log_path, max_age_seconds=90):
-    """Thin wrapper — delegates to window_utils for consistency."""
-    return window_utils.is_log_active(log_path, max_age_seconds=max_age_seconds)
-
-
-def _is_pid_alive(pid):
-    """Return True if the given PID corresponds to a running process."""
-    if pid is None:
-        return False
-    try:
-        import ctypes
-        handle = ctypes.windll.kernel32.OpenProcess(0x0400, False, pid)  # PROCESS_QUERY_INFORMATION
-        if not handle:
-            return False
-        exit_code = ctypes.c_ulong(0)
-        ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))
-        ctypes.windll.kernel32.CloseHandle(handle)
-        return exit_code.value == 259  # STILL_ACTIVE
-    except Exception:
-        return False
-
-
 def _find_running_accounts(tracked_players):
     """
-    Return a dict of { account_name -> pid } for accounts that are
-    currently in a live Roblox session.
+    Return {account_name -> pid} for accounts currently considered active.
 
-    All three conditions must be true for an account to be considered running:
-      1. A Roblox window for that account exists.
-      2. The process for that window (PID) is still alive.
-      3. The account's log file was updated within the last 10 seconds.
-
-    If any condition fails, the account is NOT considered running and will
-    be eligible for launch.
+    This follows the same status definition used by the UI so relaunch
+    decisions stay in sync with what the user sees on-screen.
     """
-    settings = load_settings()
-    log_dir  = settings.get("general", {}).get("log_path", "")
-
-    # Build hwnd -> pid map for all visible Roblox windows
-    hwnd_pid: dict = {}
-    for hwnd in window_utils.get_roblox_windows():
-        try:
-            _, pid = win32process.GetWindowThreadProcessId(hwnd)
-            hwnd_pid[hwnd] = pid
-        except Exception:
-            continue
-
-    running: dict = {}
-    for name in tracked_players:
-        # Condition 1: find the window that belongs to this account
-        matched_hwnd = None
-        matched_pid  = None
-        for hwnd, pid in hwnd_pid.items():
-            acct = window_utils.resolve_account_for_window(hwnd, [name])
-            if acct == name:
-                matched_hwnd = hwnd
-                matched_pid  = pid
-                break
-
-        if matched_hwnd is None:
-            continue  # no window → not running
-
-        # Condition 2: PID is alive
-        if not _is_pid_alive(matched_pid):
-            continue
-
-        # Condition 3: log file updated within the last 10 seconds
-        log_path = window_utils.find_log_for_player(name, log_dir) if log_dir else None
-        if not window_utils.is_log_active(log_path, max_age_seconds=10):
-            continue
-
-        running[name] = matched_pid
-
-    return running
+    return window_utils.get_active_account_pids(tracked_players)
 
 
 def auto_launch_loop():
@@ -144,7 +77,7 @@ def auto_launch_loop():
         delay_seconds = int(settings.get("general", {}).get("auto_launch_delay", 5))
         tracked_players = list(players.keys())
 
-        # 1. Find running accounts
+        # 1. Find active accounts using the same logic shown in the UI
         running_accounts = _find_running_accounts(tracked_players)
 
         # 2. Check each desired account
@@ -162,9 +95,9 @@ def auto_launch_loop():
                 continue
 
             if name in running_accounts:
-                # Account is running — check if it has disconnected
+                # Account is active - check if it has disconnected
                 settings = load_settings()
-                log_dir  = settings.get("general", {}).get("log_path", "")
+                log_dir = settings.get("general", {}).get("log_path", "")
                 log_path = window_utils.find_log_for_player(name, log_dir) if log_dir else None
 
                 if is_disconnected(log_path):
@@ -190,7 +123,7 @@ def auto_launch_loop():
                     window_utils._log_instance_cache.clear()
                     time.sleep(2)
             else:
-                # Account not running — check cooldown before launching
+                # Account not active - check cooldown before launching
                 if time.time() - recently_launched.get(name, 0) < 60:
                     continue
 
@@ -210,7 +143,7 @@ def auto_launch_loop():
                     if "AUTH_FAILED" in msg:
                         mark_cookie_invalid(name, invalid=True)
                         signals.log_message.emit(
-                            f"[ERROR] {name} cookie is invalid or expired — marked as bad."
+                            f"[ERROR] {name} cookie is invalid or expired - marked as bad."
                         )
                     else:
                         signals.log_message.emit(f"[ERROR] Auto-Launch {name} failed: {msg}")

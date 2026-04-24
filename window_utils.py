@@ -295,3 +295,35 @@ def resolve_accounts_for_windows(
         result[hwnd] = matched
 
     return result
+
+
+def get_active_account_hwnds(tracked_players: List[str]) -> Dict[str, int]:
+    """
+    Return {player_name: hwnd} for accounts currently considered active by the UI.
+
+    The UI defines an account as active when there is a visible Roblox window that
+    can be resolved back to one of the tracked player names.
+    """
+    active: Dict[str, int] = {}
+    for hwnd in get_roblox_windows():
+        try:
+            player_name = resolve_account_for_window(hwnd, tracked_players)
+        except Exception:
+            player_name = None
+        if player_name and player_name not in active:
+            active[player_name] = hwnd
+    return active
+
+
+def get_active_account_pids(tracked_players: List[str]) -> Dict[str, int]:
+    """
+    Return {player_name: pid} using the same active-account definition as the UI.
+    """
+    active: Dict[str, int] = {}
+    for player_name, hwnd in get_active_account_hwnds(tracked_players).items():
+        try:
+            _tid, pid = win32process.GetWindowThreadProcessId(hwnd)
+        except Exception:
+            continue
+        active[player_name] = pid
+    return active
