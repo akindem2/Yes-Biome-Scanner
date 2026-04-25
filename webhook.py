@@ -5,7 +5,7 @@ import time
 from datetime import datetime, timezone
 from settings_manager import load_settings, BIOME_ALL_KEYS, MERCHANT_ROLE_ID_KEYS
 
-version      = "1.2.0"
+version      = "1.2.2"
 discord_link = "https://discord.gg/fGTNj2sAfA"
 
 BIOMES = {
@@ -22,6 +22,7 @@ BIOMES = {
     "windy":       {"color": 0x66ccff, "icon": "https://i.postimg.cc/Y98ysrZR/Screenshot-2026-01-24-144103.png", "type": "common",   "length": 120},
     "rainy":       {"color": 0x3366ff, "icon": "https://i.postimg.cc/wv3bn8pF/Screenshot-2026-01-24-144429.png", "type": "common",   "length": 120},
     "eggland":     {"color": 0xeefc4f, "icon": "https://i.postimg.cc/66jdjhyg/Screenshot-2026-03-28-183948.png", "type": "common"},
+    "singularity": {"color": 0x000000, "icon": "https://images.stockcake.com/public/1/5/a/15a57388-244b-4e36-ade9-871b031bb041_medium/cosmic-anime-vortex-stockcake.jpg", "type": "rare"},
 }
 
 MERCHANTS = {

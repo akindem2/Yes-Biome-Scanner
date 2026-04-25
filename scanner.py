@@ -169,22 +169,28 @@ def read_new_lines(player_name, info):
 
     found_biome = None
 
-    # Map variations to standard internal names
+    # Each entry: (hoverText as it appears in the log, internal biome name)
+    BIOME_DEFINITIONS = [
+        ("SNOWY",       "snowy"),
+        ("RAINY",       "rainy"),
+        ("EGGLAND",     "eggland"),
+        ("WINDY",       "windy"),
+        ("CORRUPTION",  "corruption"),
+        ("HEAVEN",      "heaven"),
+        ("HELL",        "hell"),
+        ("NULL",        "null"),
+        ("GLITCHED",    "glitched"),
+        ("DREAMSPACE",  "dreamspace"),
+        ("SAND STORM",  "sand storm"),
+        ("STARFALL",    "starfall"),
+        ("CYBERSPACE",  "cyberspace"),
+        ("SINGULARITY", "singularity"),
+    ]
+
+    # Format matches the log line: {"hoverText":"[name]",
     biome_map = {
-        "snowy": "snowy",
-        "rainy": "rainy",
-        "eggland": "eggland",
-        "windy": "windy",
-        "corruption": "corruption",
-        "heaven": "heaven",
-        "hell": "hell",
-        "null": "null",
-        "glitched": "glitched",
-        "dreamspace": "dreamspace",
-        "sandstorm": "sand storm",
-        "sand storm": "sand storm",
-        "starfall": "starfall",
-        "cyberspace": "cyberspace"
+        f'{{"hoverText":"{hover}",': internal
+        for hover, internal in BIOME_DEFINITIONS
     }
 
     lines = new_data.splitlines()
@@ -206,7 +212,7 @@ def read_new_lines(player_name, info):
                 except Exception:
                     pass
 
-        line_lower = line.lower()
+        line_lower = line
         for search_str, true_biome in biome_map.items():
             if search_str in line_lower:
                 found_biome = true_biome

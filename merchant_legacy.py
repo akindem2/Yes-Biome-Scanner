@@ -321,8 +321,6 @@ def _run_ocr(image: Image.Image):
             [min(xs), max(ys)],
         ]
         lines.append({"text": text, "box": box})
-    if signals and not lines:
-        signals.log_message.emit("[MERCHANT] OCR processed screenshot but found 0 text lines")
     return lines
 
 def _scan_window_ocr(hwnd, merchants, account_name=None):
