@@ -19,12 +19,14 @@ LOG_PATH_DEFAULT = os.path.join(APPDATA, "Roblox", "logs")
 BIOME_ROLE_ID_KEYS = (
     "sand storm", "hell", "starfall", "heaven",
     "corruption", "null", "snowy", "windy", "rainy", "eggland",
+    "singularity",
 )
 
 # All biomes (used for enabled_biomes default)
 BIOME_ALL_KEYS = (
     "sand storm", "hell", "starfall", "heaven", "corruption", "null",
     "dreamspace", "glitched", "cyberspace", "snowy", "windy", "rainy", "eggland",
+    "singularity",
 )
 
 MERCHANT_ROLE_ID_KEYS = ("mari", "jester", "rin")
@@ -166,6 +168,12 @@ def _normalize_webhook(wh: dict) -> dict:
     enabled_biomes = wh.get("enabled_biomes")
     if not isinstance(enabled_biomes, list):
         enabled_biomes = list(BIOME_ALL_KEYS)
+    else:
+        # Add any biomes introduced after this webhook was saved.
+        existing = set(enabled_biomes)
+        for k in BIOME_ALL_KEYS:
+            if k not in existing:
+                enabled_biomes.append(k)
         
     try:
         delay = int(wh.get("delay_ms", 0))
@@ -305,6 +313,13 @@ def save_settings(data):
     _cached_settings = data
     _last_load_time  = time.time()
 
+    # Push new snapshot to all workers immediately.
+    # Import is local to avoid circular import with config_snapshot.
+    try:
+        import config_snapshot
+        config_snapshot.push(data)
+    except Exception:
+        pass
 
 def mark_cookie_invalid(player_name: str, invalid: bool = True):
     settings = load_settings(force=True)

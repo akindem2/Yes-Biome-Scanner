@@ -118,10 +118,12 @@ def _normalize_merchants(raw_merchants):
 def _load_runtime_settings():
     settings = load_settings()
     merchant_settings = settings.get("merchant_detection", {})
+    general_settings = settings.get("general", {})
     return {
         "scan_interval":   max(1, int(merchant_settings.get("scan_interval", 2))),
         "merchants":       _normalize_merchants(merchant_settings.get("merchants",[])),
         "tracked_players": list(settings.get("players", {}).keys()),
+        "log_dir":         str(general_settings.get("log_path", "")).strip(),
     }
 
 def _parse_expected_color(color_str):
@@ -421,13 +423,14 @@ def merchant_detector_loop():
         runtime         = _load_runtime_settings()
         merchants       = runtime["merchants"]
         tracked_players = runtime["tracked_players"]
+        log_dir         = runtime["log_dir"]
 
         if not merchants:
             time.sleep(runtime["scan_interval"])
             continue
 
         for hwnd in window_utils.get_roblox_windows():
-            account_name = window_utils.resolve_account_for_window(hwnd, tracked_players)
+            account_name = window_utils.resolve_account_for_window(hwnd, tracked_players, log_dir)
             _scan_window_ocr(hwnd, merchants, account_name)
 
         time.sleep(runtime["scan_interval"])

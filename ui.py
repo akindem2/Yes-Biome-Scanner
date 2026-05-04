@@ -24,6 +24,12 @@ except ImportError:
     WEBENGINE_AVAILABLE = False
 from trimmer import TrimmerTab  
 
+import collections
+
+import perf_log
+import os
+from account_runtime import runtime as _runtime
+
 # ------------------------------------------------------------------
 # COLOR THEMES
 # ------------------------------------------------------------------
@@ -571,6 +577,13 @@ class UISignals(QObject):
     biome_update             = pyqtSignal(str, str)
     log_message              = pyqtSignal(str)
     players_updated          = pyqtSignal(dict)
+    # Crash recovery signals — emitted by worker finally blocks
+    scanner_crashed          = pyqtSignal()
+    merchant_crashed         = pyqtSignal()
+    auto_launcher_crashed    = pyqtSignal()
+    anti_afk_crashed         = pyqtSignal()
+
+
 
 
 # ------------------------------------------------------------------
@@ -729,6 +742,37 @@ class AccountCard(QFrame):
         )
         self._dot._render()
 
+# ── UI snapshot schema ───────────────────────────────────────────────
+# Describes the dict returned by runtime.snapshot() that the UI consumes.
+# All UI reads must go through a snapshot — never runtime internals directly.
+# Updated here whenever AccountRuntime.snapshot() changes.
+from typing import TypedDict
+
+class _LogEntry(TypedDict):
+    file: str
+    pos:  int
+ 
+class _BiomeEntry(TypedDict):
+    current:  str
+    previous: str
+
+class _WindowEntry(TypedDict):
+    pid:       int
+    hwnd:      int
+    last_seen: float
+
+class _HealthEntry(TypedDict):
+    last_beat:    float
+    slow_cycles:  int
+    status:       str
+
+class UISnapshot(TypedDict):
+    log_map:      dict  # str -> _LogEntry
+    biome_state:  dict  # str -> _BiomeEntry
+    window_cache: dict  # str -> _WindowEntry
+    health:       dict  # str -> _HealthEntry
+
+# ─────────────────────────────────────────────────────────────────────
 
 class AccountOverviewPanel(QWidget):
     """
@@ -766,7 +810,12 @@ class AccountOverviewPanel(QWidget):
         # Refresh active/inactive status every 5 seconds
         self._status_timer = QTimer(self)
         self._status_timer.timeout.connect(self._refresh_status)
-        self._status_timer.start(5000)
+        self._status_timer.start(500)
+
+        # Last full snapshot — used to diff against the incoming snapshot
+        # so unchanged cards are not re-rendered on every 500 ms tick.
+        self._last_log_sizes: dict = {}
+        self._last_snapshot: dict = {}
 
     def rebuild(self, players: dict):
         """Rebuild cards whenever the player list changes."""
@@ -824,23 +873,68 @@ class AccountOverviewPanel(QWidget):
 
     def _refresh_status(self):
         """Check which accounts have an active Roblox window and update outlines."""
-        try:
-            import window_utils
-            active_names = set(window_utils.get_active_account_hwnds(list(self._cards.keys())).keys())
-        except Exception:
-            active_names = set()
+        import time as _time
+        _t0 = _time.perf_counter()
+
+        # One snapshot read per tick — shared across all card updates.
+        snap     = _runtime.snapshot()
+        log_map  = snap.get("log_map",     {})
+        biome_st = snap.get("biome_state", {})
 
         for name, card in self._cards.items():
-            card.set_active(name in active_names)
-
-        # Sync biomes from scanner state
-        try:
-            import scanner
-            for name, card in self._cards.items():
-                biome = scanner.current_biome.get(name, "")
-                card.set_biome(biome)
-        except Exception:
-            pass
+            # ── Diff: skip this card if neither log nor biome changed ──
+            prev = self._last_snapshot.get(name, {})
+            curr_log   = log_map.get(name,  {})
+            curr_biome = biome_st.get(name, {})
+            if (curr_log   == prev.get("log")   and
+                    curr_biome == prev.get("biome")):
+                continue   # nothing changed — skip widget update
+ 
+            self._last_snapshot[name] = {"log": curr_log, "biome": curr_biome}
+ 
+            # ── Active/inactive: same file-size-growth logic as before ──
+            info = curr_log
+            if not info:
+                self._last_log_sizes.pop(name, None)
+                card.set_active(False)
+                card.set_biome("")
+                continue
+ 
+            log_path = info.get("file")
+            if not log_path:
+                self._last_log_sizes.pop(name, None)
+                card.set_active(False)
+                card.set_biome("")
+                continue
+ 
+            try:
+                current_size = os.path.getsize(log_path)
+            except OSError:
+                self._last_log_sizes.pop(name, None)
+                card.set_active(False)
+                card.set_biome("")
+                continue
+ 
+            last_size = self._last_log_sizes.get(name)
+            if last_size is None:
+                self._last_log_sizes[name] = current_size
+                card.set_active(False)
+            elif current_size > last_size:
+                self._last_log_sizes[name] = current_size
+                card.set_active(True)
+            else:
+                self._last_log_sizes[name] = current_size
+                card.set_active(False)
+ 
+            # Biome from snapshot — no worker module import
+            card.set_biome(curr_biome.get("current", ""))
+ 
+        # ── Slow-UI warning ───────────────────────────────────────────
+        elapsed_ms = (_time.perf_counter() - _t0) * 1000
+        if elapsed_ms > 100:
+            perf_log._log.warning(
+                "[PERF] ui._refresh_status took %.1f ms (regression)", elapsed_ms
+            )
 
     def _load_avatar(self, username: str):
         if username in _avatar_cache:
@@ -1022,6 +1116,31 @@ class BiomeScannerUI(QWidget):
         self.signals.log_message.connect(self.append_log)
         self.overview_panel.account_selected.connect(self._on_account_selected)
 
+        # Crash recovery
+        self.signals.scanner_crashed.connect(self._on_scanner_crashed)
+        self.signals.merchant_crashed.connect(self._on_merchant_crashed)
+        self.signals.auto_launcher_crashed.connect(self._on_auto_launcher_crashed)
+        self.signals.anti_afk_crashed.connect(self._on_anti_afk_crashed)
+
+        # Log buffer — all worker threads append here; main thread drains it.
+        # maxlen=2000 caps memory; oldest lines are silently dropped on overflow.
+        self._log_buffer: collections.deque = collections.deque(maxlen=2000)
+
+        self._log_drain_timer = QTimer(self)
+        self._log_drain_timer.timeout.connect(self._drain_log_buffer)
+        self._log_drain_timer.start(300)   # drain every 300 ms
+
+        # ── Health status bar ─────────────────────────────────────────
+        self._health_label = QLabel("")
+        self._health_label.setObjectName("hint")
+        self._health_label.setAlignment(Qt.AlignmentFlag.AlignRight)
+        root.addWidget(self._health_label)
+
+        self._health_timer = QTimer(self)
+        self._health_timer.timeout.connect(self._refresh_health_bar)
+        self._health_timer.start(2000)
+
+
         self.apply_theme()
 
     # ── Theme ────────────────────────────────────────────────────
@@ -1161,6 +1280,70 @@ class BiomeScannerUI(QWidget):
                 btn.setChecked(target)
                 handler()
 
+    def _on_scanner_crashed(self):
+        """Scanner loop died — reset toggle + dot on the UI thread."""
+        self.toggle_btn.blockSignals(True)
+        self.toggle_btn.setChecked(False)
+        self.toggle_btn.blockSignals(False)
+        self.toggle_btn.setText("\u25b6 Scanner")
+        self._scan_dot.set_active(False)
+        self.append_log("[ERROR] Scanner stopped unexpectedly. Check console.")
+
+    def _on_merchant_crashed(self):
+        self.merchant_toggle_btn.blockSignals(True)
+        self.merchant_toggle_btn.setChecked(False)
+        self.merchant_toggle_btn.blockSignals(False)
+        self.merchant_toggle_btn.setText("\u25b6 Merchant")
+        self._merchant_dot.set_active(False)
+        self.merchant_mode_combo.setEnabled(True)
+        self.append_log("[ERROR] Merchant detector stopped unexpectedly. Check console.")
+
+    def _on_auto_launcher_crashed(self):
+        self.auto_toggle_btn.blockSignals(True)
+        self.auto_toggle_btn.setChecked(False)
+        self.auto_toggle_btn.blockSignals(False)
+        self.auto_toggle_btn.setText("\u25b6 Auto Launch")
+        self._auto_dot.set_active(False)
+        self.append_log("[ERROR] Auto-Launcher stopped unexpectedly. Check console.")
+
+    def _on_anti_afk_crashed(self):
+        self.afk_toggle_btn.blockSignals(True)
+        self.afk_toggle_btn.setChecked(False)
+        self.afk_toggle_btn.blockSignals(False)
+        self.afk_toggle_btn.setText("\u25b6 Anti-AFK")
+        self._afk_dot.set_active(False)
+        self.append_log("[ERROR] Anti-AFK stopped unexpectedly. Check console.")
+
+    def _refresh_health_bar(self):
+        """Update the health status bar from the runtime snapshot."""
+        health = _runtime.snapshot().get("health", {})
+        if not health:
+            self._health_label.setText("")
+            return
+
+        parts = []
+        status_colors = {"OK": "#3edfa0", "SLOW": "#e0c35e", "DEAD": "#e05555"}
+        subsystem_labels = {
+            "scanner":           "Scanner",
+            "merchant_detector": "Merchant",
+            "log_indexer":       "Indexer",
+            "window_poller":     "Win Poll",
+        }
+        for key, label in subsystem_labels.items():
+            entry  = health.get(key, {})
+            status = entry.get("status", "—")
+            color  = status_colors.get(status, "#7c8499")
+            parts.append(
+                f'<span style="color:{color}">{label}: {status}</span>'
+            )
+
+        self._health_label.setText("  |  ".join(parts))
+        self._health_label.setTextFormat(Qt.TextFormat.RichText)
+
+    def open_settings(self):
+        self.settings_window = SettingsWindow(self)
+        self.settings_window.show()
+
     def closeEvent(self, event):
         try:
             self.trimmer_tab.shutdown()
@@ -1186,22 +1369,53 @@ class BiomeScannerUI(QWidget):
         self.append_log(f"[BIOME] {player} \u2192 {biome.upper()}")
 
     def append_log(self, text: str):
-        cursor = self.log_box.textCursor()
-        cursor.movePosition(QTextCursor.MoveOperation.End)
-        fmt = QTextCharFormat()
-        fmt.setForeground(QColor(COLORS["text_dim"]))
-        for tag, color in LOG_COLORS.items():
-            if tag in text:
-                fmt.setForeground(QColor(color))
-                break
-        cursor.insertText(text + "\n", fmt)
-        self.log_box.setTextCursor(cursor)
-        self.log_box.ensureCursorVisible()
+        # Thread-safe: deque.append() is atomic in CPython under the GIL.
+        # No Qt operations here — those happen only in _drain_log_buffer().
+        self._log_buffer.append(text)
 
-    def open_settings(self):
-        self.settings_window = SettingsWindow(self)
-        self.settings_window.show()
+    def _drain_log_buffer(self):
+        """Drain pending log lines from the buffer into the QTextEdit.
+       Runs on the main (UI) thread every 300 ms.
+        """
+        if not self._log_buffer:
+            return
 
+        # Snapshot the buffer in one operation to avoid holding the drain open
+        # while new items arrive. popleft() in a loop is also safe but slower.
+        lines = []
+        try:
+            while True:
+                lines.append(self._log_buffer.popleft())
+        except IndexError:
+            pass
+
+        if not lines:
+            return
+
+        with perf_log.timed("ui._drain_log_buffer", threshold_ms=50):
+            cursor = self.log_box.textCursor()
+            cursor.movePosition(QTextCursor.MoveOperation.End)
+            fmt = QTextCharFormat()
+
+            for text in lines:
+                fmt.setForeground(QColor(COLORS["text_dim"]))
+                for tag, color in LOG_COLORS.items():
+                    if tag in text:
+                        fmt.setForeground(QColor(color))
+                        break
+                cursor.insertText(text + "\n", fmt)
+
+            self.log_box.setTextCursor(cursor)
+            self.log_box.ensureCursorVisible()
+
+            # Cap visible history at 2000 lines to bound memory.
+            doc = self.log_box.document()
+            while doc.blockCount() > 2000:
+                c2 = QTextCursor(doc.begin())
+                c2.select(QTextCursor.SelectionType.BlockUnderCursor)
+                c2.movePosition(QTextCursor.MoveOperation.NextCharacter,
+                                QTextCursor.MoveMode.KeepAnchor)
+                c2.removeSelectedText()
 
 # ------------------------------------------------------------------
 # CALIBRATE OVERLAY
@@ -1387,6 +1601,12 @@ class SettingsWindow(QWidget):
 
         self.sidebar.setCurrentRow(0)
         self.apply_theme()
+
+        # Perf logging toggle — hidden in Help menu
+
+        # Also honour env var at startup
+        if os.getenv("BIOME_PERF_LOG") == "1":
+            perf_log.set_enabled(True)
 
     # ── Theme ─────────────────────────────────────────────────────
     def apply_theme(self):
@@ -2488,6 +2708,7 @@ class SettingsWindow(QWidget):
         "sand storm", "hell", "starfall", "heaven",
         "corruption", "null", "dreamspace", "glitched",
         "cyberspace", "snowy", "windy", "rainy", "eggland",
+        "singularity",
     ]
 
     _AI_BIOME_NEVER = "__never__"

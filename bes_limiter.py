@@ -7,6 +7,7 @@ available, and falls back to the pure-Python implementation (`bes_limiter_py`).
 
 from __future__ import annotations
 
+
 try:
     from bes_limiter_native import (  # type: ignore
         BESLimiterWorker,

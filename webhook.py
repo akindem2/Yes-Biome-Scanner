@@ -1,48 +1,37 @@
 import requests
 import json
-import threading
 import time
 from datetime import datetime, timezone
 from settings_manager import load_settings, BIOME_ALL_KEYS, MERCHANT_ROLE_ID_KEYS
 
-version      = "1.2.2"
+import webhook_queue
+from webhook_queue import WebhookTask
+
+version      = "1.3.0"
 discord_link = "https://discord.gg/fGTNj2sAfA"
 
 BIOMES = {
-    "sand storm":  {"color": 0x9e7951, "icon": "https://i.postimg.cc/RV5j7tTV/Screenshot-2026-01-24-022828.png", "type": "rare",     "length": 650},
-    "hell":        {"color": 0x4a0f0f, "icon": "https://i.postimg.cc/J7JFznW4/Screenshot-2026-01-24-022445.png", "type": "rare",     "length": 666},
-    "starfall":    {"color": 0x3896d9, "icon": "https://i.postimg.cc/6pHjm4CC/Screenshot-2026-01-24-021625.png", "type": "rare",     "length": 600},
-    "heaven":      {"color": 0xc4a73d, "icon": "https://i.postimg.cc/MptNJFJY/Screenshot-2026-01-24-022645.png", "type": "rare",     "length": 240},
-    "corruption":  {"color": 0x4b1896, "icon": "https://i.postimg.cc/ncGwqPzd/Screenshot-2026-01-24-022047.png", "type": "rare",     "length": 650},
-    "null":        {"color": 0x4a4a4a, "icon": "https://i.postimg.cc/9fK94cH6/Screenshot-2026-01-24-023128.png", "type": "rare",     "length": 99},
-    "dreamspace":  {"color": 0xe32ddd, "icon": "https://i.postimg.cc/25nwjyVg/Screenshot-2026-01-25-014034.png", "type": "everyone", "length": 192},
-    "glitched":    {"color": 0x00ff33, "icon": "https://i.postimg.cc/jj0Kfn2L/Screenshot-2026-01-25-001319.png", "type": "everyone", "length": 164},
-    "cyberspace":  {"color": 0x023db3, "icon": "https://i.postimg.cc/28Bym3tD/Screenshot-2026-01-26-203242.png", "type": "everyone", "length": 720},
-    "snowy":       {"color": 0x99ccff, "icon": "https://i.postimg.cc/g0sDYMsP/Screenshot-2026-01-24-144259.png", "type": "common",   "length": 120},
-    "windy":       {"color": 0x66ccff, "icon": "https://i.postimg.cc/Y98ysrZR/Screenshot-2026-01-24-144103.png", "type": "common",   "length": 120},
-    "rainy":       {"color": 0x3366ff, "icon": "https://i.postimg.cc/wv3bn8pF/Screenshot-2026-01-24-144429.png", "type": "common",   "length": 120},
-    "eggland":     {"color": 0xeefc4f, "icon": "https://i.postimg.cc/66jdjhyg/Screenshot-2026-03-28-183948.png", "type": "common"},
-    "singularity": {"color": 0x000000, "icon": "https://images.stockcake.com/public/1/5/a/15a57388-244b-4e36-ade9-871b031bb041_medium/cosmic-anime-vortex-stockcake.jpg", "type": "rare"},
+    "sand storm":  {"color": 0x9e7951, "icon": "https://raw.githubusercontent.com/akindem2/Yes-Biome-Scanner/refs/heads/main/sand%20storm.png", "type": "rare",     "length": 650},
+    "hell":        {"color": 0x4a0f0f, "icon": "https://raw.githubusercontent.com/akindem2/Yes-Biome-Scanner/refs/heads/main/hell.png", "type": "rare",     "length": 666},
+    "starfall":    {"color": 0x3896d9, "icon": "https://raw.githubusercontent.com/akindem2/Yes-Biome-Scanner/refs/heads/main/starfall.png", "type": "rare",     "length": 600},
+    "heaven":      {"color": 0xc4a73d, "icon": "https://raw.githubusercontent.com/akindem2/Yes-Biome-Scanner/refs/heads/main/heaven.png", "type": "rare",     "length": 240},
+    "corruption":  {"color": 0x4b1896, "icon": "https://raw.githubusercontent.com/akindem2/Yes-Biome-Scanner/refs/heads/main/corruption.png", "type": "rare",     "length": 650},
+    "null":        {"color": 0x4a4a4a, "icon": "https://raw.githubusercontent.com/akindem2/Yes-Biome-Scanner/refs/heads/main/null.png", "type": "rare",     "length": 99},
+    "dreamspace":  {"color": 0xe32ddd, "icon": "https://raw.githubusercontent.com/akindem2/Yes-Biome-Scanner/refs/heads/main/dreamspace.png", "type": "everyone", "length": 192},
+    "glitched":    {"color": 0x00ff33, "icon": "https://raw.githubusercontent.com/akindem2/Yes-Biome-Scanner/refs/heads/main/glitched.png", "type": "everyone", "length": 164},
+    "cyberspace":  {"color": 0x023db3, "icon": "https://raw.githubusercontent.com/akindem2/Yes-Biome-Scanner/refs/heads/main/cyberspace.png", "type": "everyone", "length": 720},
+    "snowy":       {"color": 0x99ccff, "icon": "https://raw.githubusercontent.com/akindem2/Yes-Biome-Scanner/refs/heads/main/snowy.png", "type": "common",   "length": 120},
+    "windy":       {"color": 0x66ccff, "icon": "https://raw.githubusercontent.com/akindem2/Yes-Biome-Scanner/refs/heads/main/windy.png", "type": "common",   "length": 120},
+    "rainy":       {"color": 0x3366ff, "icon": "https://raw.githubusercontent.com/akindem2/Yes-Biome-Scanner/refs/heads/main/rainy.png", "type": "common",   "length": 120},
+    "eggland":     {"color": 0xeefc4f, "icon": "https://raw.githubusercontent.com/akindem2/Yes-Biome-Scanner/refs/heads/main/eggland.png", "type": "common"},
+    "singularity": {"color": 0x000000, "icon": "https://raw.githubusercontent.com/akindem2/Yes-Biome-Scanner/refs/heads/main/singularity.png", "type": "rare", "length": 1200},
 }
 
 MERCHANTS = {
-    "mari":   {"icon": "https://i.postimg.cc/ryjLBcx5/Screenshot-2026-01-24-143823.png"},
-    "jester": {"icon": "https://i.postimg.cc/rw0XRrbH/Screenshot-2026-01-24-143919.png"},
-    "rin":    {"icon": "https://static.wikia.nocookie.net/sol-rng/images/0/04/RinHeadShot.png/revision/latest?cb=20260214165200"},
+    "mari":   {"icon": "https://raw.githubusercontent.com/akindem2/Yes-Biome-Scanner/refs/heads/main/mari.png"},
+    "jester": {"icon": "https://raw.githubusercontent.com/akindem2/Yes-Biome-Scanner/refs/heads/main/jester.png"},
+    "rin":    {"icon": "https://raw.githubusercontent.com/akindem2/Yes-Biome-Scanner/refs/heads/main/rin.png"},
 }
-
-# -------------------------------------------------------------------
-# THREADING & DELAY LOGIC
-# -------------------------------------------------------------------
-_webhook_locks = {}
-_webhook_last_sent = {}
-_global_webhook_lock = threading.Lock()
-
-def _get_url_lock(url):
-    with _global_webhook_lock:
-        if url not in _webhook_locks:
-            _webhook_locks[url] = threading.Lock()
-        return _webhook_locks[url]
 
 def _get_all_unique_webhooks() -> dict[str, int]:
     settings = load_settings()
@@ -145,37 +134,22 @@ def send_webhook(embed, webhook_url, content=None, image_bytes=None, delay_ms=0)
     if not webhook_url:
         return
 
-    url_lock = _get_url_lock(webhook_url)
-    with url_lock:
-        if delay_ms > 0:
-            delay_s = delay_ms / 1000.0
-            now = time.time()
-            last_sent = _webhook_last_sent.get(webhook_url, 0)
-            elapsed = now - last_sent
-            if elapsed < delay_s:
-                time.sleep(delay_s - elapsed)
+    # Non-blocking enqueue - caller returns immediately.
+    # The per-URL worker thread handles delay, send, and retry.
+    webhook_queue.enqueue(WebhookTask(
+        url=webhook_url,
+        embed=embed,
+        content=content,
+        image_bytes=image_bytes,
+        delay_ms=delay_ms,
+    ))
 
-        try:
-            payload = {"embeds": [embed]}
-            if content:
-                payload["content"] = content
-            if image_bytes:
-                requests.post(
-                    webhook_url,
-                    data={"payload_json": json.dumps(payload)},
-                    files={"file": ("screenshot.png", image_bytes, "image/png")},
-                )
-            else:
-                requests.post(webhook_url, json=payload)
-        except Exception as e:
-            print("[WEBHOOK ERROR]", e)
-        finally:
-            _webhook_last_sent[webhook_url] = time.time()
+
 
 # -------------------------------------------------------------------
 # BIOME FOUND / ENDED
 # -------------------------------------------------------------------
-def send_webhook_found_message(biome_name, account_name, ps_link):
+def send_webhook_found_message(biome_name, account_name, ps_link: str = ""):
     if biome_name not in BIOMES:
         return
 
@@ -185,9 +159,9 @@ def send_webhook_found_message(biome_name, account_name, ps_link):
         if "length" in biome else "whenever"
     )
 
-    settings    = load_settings()
-    player_data = settings.get("players", {}).get(account_name, {})
-    actual_ps   = player_data.get("pslink", "") if isinstance(player_data, dict) else ""
+    # ps_link is passed in directly by the caller (scanner.py reads it from
+    # player_pslinks which is already in memory).  No settings disk read needed.
+    actual_ps = ps_link or ""
 
     webhook_entries = _get_biome_webhooks_for_player(account_name)
     if not webhook_entries:
@@ -257,6 +231,7 @@ def send_merchant_detected_message(
     detected_color=None,
     chat_image_bytes=None,
     show_image: bool = True,
+    ps_link: str = "",
 ):
     """
     Send a merchant-detected webhook embed.
@@ -268,9 +243,7 @@ def send_merchant_detected_message(
                                 Used by the log-based detector which has no
                                 screenshot to share.
     """
-    settings    = load_settings()
-    player_data = settings.get("players", {}).get(account_name, {})
-    ps_link     = player_data.get("pslink", "") if isinstance(player_data, dict) else (player_data or "")
+    # ps_link supplied by caller — no load_settings() needed here
 
     webhook_entries = _get_merchant_webhooks_for_player(account_name)
     if not webhook_entries:

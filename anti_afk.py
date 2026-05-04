@@ -5,6 +5,13 @@ import win32gui
 import win32process
 from settings_manager import load_settings
 
+import perf_log
+
+from account_runtime import runtime
+
+
+import window_utils
+
 VK_SPACE         = 0x20
 KEYEVENTF_KEYUP  = 0x0002
 KEYEVENTF_SCANCODE = 0x0008
@@ -19,17 +26,6 @@ def init(sig):
     signals = sig
     signals.start_anti_afk.connect(start_anti_afk)
     signals.stop_anti_afk.connect(stop_anti_afk)
-
-
-def get_roblox_windows():
-    hwnds = []
-    def _cb(hwnd, _):
-        if win32gui.IsWindowVisible(hwnd) and win32gui.GetWindowText(hwnd) == "Roblox":
-            hwnds.append(hwnd)
-        return True
-    win32gui.EnumWindows(_cb, None)
-    return hwnds
-
 
 def _get_pid_for_hwnd(hwnd: int) -> int | None:
     try:
@@ -153,7 +149,12 @@ def _send_space(hwnd: int) -> bool:
 
 
 def perform_anti_afk():
-    roblox_hwnds = get_roblox_windows()
+    # Use the window poller's cached hwnd list — no live enumeration.
+    roblox_hwnds = [
+        entry["hwnd"]
+        for entry in runtime.all_windows().values()
+        if entry.get("hwnd")
+    ]
     if not roblox_hwnds:
         return
 
@@ -204,15 +205,23 @@ def anti_afk_loop():
     settings = load_settings()
     interval = int(settings.get("general", {}).get("anti_afk_interval", 600))
     last_trigger_time = time.time()
+    try:
+        while anti_afk_running:
+            if time.time() - last_trigger_time >= interval:
+                perform_anti_afk()
+                settings = load_settings()
+                interval = int(settings.get("general", {}).get("anti_afk_interval", 600))
+                last_trigger_time = time.time()
+            time.sleep(1)
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        if signals:
+            signals.log_message.emit("[ERROR] Anti-AFK crashed")
+            signals.anti_afk_crashed.emit()
 
-    while anti_afk_running:
-        if time.time() - last_trigger_time >= interval:
-            perform_anti_afk()
-            settings = load_settings()
-            interval = int(settings.get("general", {}).get("anti_afk_interval", 600))
-            last_trigger_time = time.time()
-        time.sleep(1)
-
+    finally:
+        anti_afk_running = False
 
 def start_anti_afk():
     global anti_afk_running

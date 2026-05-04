@@ -20,6 +20,19 @@ import win32process
 
 from settings_manager import load_settings
 
+import perf_log
+
+# ── THREADING NOTES (Phase 1.4 concurrency audit) ──────────────────────────
+# _log_instance_cache: written and read by any caller of
+# resolve_account_for_window().  Callers include auto_launcher (worker thread)
+# and bes_manager (worker thread).  If both call concurrently: UNSAFE.
+# Individual dict[key]=value is atomic under GIL; iterate-and-evict (Phase 2.2)
+# is NOT atomic — run eviction on one thread only until Phase 3.5.
+# Phase 3.5: window_poller owns this cache exclusively; constraint lifted.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -160,7 +173,11 @@ def extract_log_instance_id(log_path: str) -> Optional[int]:
     """
     cached = _log_instance_cache.get(log_path)
     if cached:
-        return cached["instance_id"]
+        # Evict if the file has been deleted since we cached it.
+        if os.path.exists(log_path):
+            return cached["instance_id"]
+        # File gone — drop stale entry and fall through to re-probe.
+        del _log_instance_cache[log_path]
 
     instance_id: Optional[int] = None
     try:
@@ -181,18 +198,32 @@ def extract_log_instance_id(log_path: str) -> Optional[int]:
 
     return instance_id
 
+def _evict_stale_log_cache() -> int:
+    """
+    Remove entries from _log_instance_cache whose file no longer exists.
+    Returns the number of entries evicted.
+    Call this on the window-poller timer (Phase 3.5), not from a hot path.
+    Safe to call from a single thread only — see THREADING NOTES at top of file.
+    """
+    stale = [path for path in list(_log_instance_cache) if not os.path.exists(path)]
+    for path in stale:
+        del _log_instance_cache[path]
+    return len(stale)
 
 # ---------------------------------------------------------------------------
 # Window -> account resolution
 # ---------------------------------------------------------------------------
-def resolve_account_for_window(hwnd: int, tracked_players: List[str]) -> Optional[str]:
+def resolve_account_for_window(
+    hwnd: int,
+    tracked_players: List[str],
+    log_dir: str = "",
+) -> Optional[str]:
     """
     Return the tracked player name that owns the given Roblox window, or None.
 
-    Reads settings to find the log directory, scans active logs to find each
-    player, then matches the log's instance ID against the window's PID/TIDs.
-    Fully standalone — no dependency on scanner.player_logs or any other module's
-    runtime state.
+    log_dir must be the Roblox log directory path.  Callers are responsible for
+    reading it from settings once and passing it in — this function never calls
+    load_settings() itself.
     """
     try:
         from bes_limiter import list_thread_ids
@@ -204,11 +235,9 @@ def resolve_account_for_window(hwnd: int, tracked_players: List[str]) -> Optiona
     except Exception:
         return None
 
-    settings = load_settings()
-    log_dir: str = settings.get("general", {}).get("log_path", "")
     if not log_dir:
         return None
-
+    
     tids: Optional[set] = None
 
     for player_name in tracked_players:
@@ -240,61 +269,65 @@ def resolve_account_for_window(hwnd: int, tracked_players: List[str]) -> Optiona
 def resolve_accounts_for_windows(
     hwnds: List[int],
     tracked_players: List[str],
+    log_dir: str = "",
 ) -> Dict[int, Optional[str]]:
     """
     Batch version of resolve_account_for_window.
     Returns {hwnd: player_name_or_None} for every hwnd in the list.
-    Reads each log file at most once across the whole batch for efficiency.
+    Reads each log file header at most once across the whole batch for efficiency.
+    Caller must supply log_dir — this function never calls load_settings().
     """
-    try:
-        from bes_limiter import list_thread_ids
-    except Exception:
-        list_thread_ids = None
+    with perf_log.timed("resolve_account_for_window", threshold_ms=100):
 
-    settings = load_settings()
-    log_dir: str = settings.get("general", {}).get("log_path", "")
 
-    # Pre-load instance IDs for all tracked players (each log read once)
-    player_instance_ids: Dict[str, Optional[int]] = {}
-    for player_name in tracked_players:
-        log_path = find_log_for_player(player_name, log_dir) if log_dir else None
-        player_instance_ids[player_name] = (
-            extract_log_instance_id(log_path) if log_path else None
-        )
-
-    result: Dict[int, Optional[str]] = {}
-    for hwnd in hwnds:
         try:
-            _tid, pid = win32process.GetWindowThreadProcessId(hwnd)
+            from bes_limiter import list_thread_ids
         except Exception:
-            result[hwnd] = None
-            continue
+            list_thread_ids = None
 
-        tids: Optional[set] = None
-        matched: Optional[str] = None
+    # log_dir supplied by caller — no load_settings() here
 
+        # Pre-load instance IDs for all tracked players (each log read once)
+        player_instance_ids: Dict[str, Optional[int]] = {}
         for player_name in tracked_players:
-            instance_id = player_instance_ids.get(player_name)
-            if instance_id is None:
+            log_path = find_log_for_player(player_name, log_dir) if log_dir else None
+            player_instance_ids[player_name] = (
+                extract_log_instance_id(log_path) if log_path else None
+            )
+
+        result: Dict[int, Optional[str]] = {}
+        for hwnd in hwnds:
+            try:
+                _tid, pid = win32process.GetWindowThreadProcessId(hwnd)
+            except Exception:
+                result[hwnd] = None
                 continue
 
-            if instance_id == pid:
-                matched = player_name
-                break
+            tids: Optional[set] = None
+            matched: Optional[str] = None
 
-            if list_thread_ids is not None:
-                if tids is None:
-                    try:
-                        tids = set(list_thread_ids(pid))
-                    except Exception:
-                        tids = set()
-                if instance_id in tids:
+            for player_name in tracked_players:
+                instance_id = player_instance_ids.get(player_name)
+                if instance_id is None:
+                    continue
+
+                if instance_id == pid:
                     matched = player_name
                     break
 
-        result[hwnd] = matched
+                if list_thread_ids is not None:
+                    if tids is None:
+                        try:
+                            tids = set(list_thread_ids(pid))
+                        except Exception:
+                            tids = set()
+                    if instance_id in tids:
+                        matched = player_name
+                        break
 
-    return result
+            result[hwnd] = matched
+
+        return result
 
 
 def get_active_account_hwnds(tracked_players: List[str]) -> Dict[str, int]:
@@ -304,26 +337,30 @@ def get_active_account_hwnds(tracked_players: List[str]) -> Dict[str, int]:
     The UI defines an account as active when there is a visible Roblox window that
     can be resolved back to one of the tracked player names.
     """
-    active: Dict[str, int] = {}
-    for hwnd in get_roblox_windows():
-        try:
-            player_name = resolve_account_for_window(hwnd, tracked_players)
-        except Exception:
-            player_name = None
-        if player_name and player_name not in active:
-            active[player_name] = hwnd
-    return active
+    with perf_log.timed("get_active_account_hwnds", threshold_ms=50):
+        active: Dict[str, int] = {}
+        for hwnd in get_roblox_windows():
+            try:
+                player_name = resolve_account_for_window(hwnd, tracked_players)
+            except Exception:
+                player_name = None
+            if player_name and player_name not in active:
+                active[player_name] = hwnd
+        return active
 
 
 def get_active_account_pids(tracked_players: List[str]) -> Dict[str, int]:
     """
     Return {player_name: pid} using the same active-account definition as the UI.
     """
-    active: Dict[str, int] = {}
-    for player_name, hwnd in get_active_account_hwnds(tracked_players).items():
-        try:
-            _tid, pid = win32process.GetWindowThreadProcessId(hwnd)
-        except Exception:
-            continue
-        active[player_name] = pid
-    return active
+    with perf_log.timed("get_active_account_pids", threshold_ms=50):
+
+
+        active: Dict[str, int] = {}
+        for player_name, hwnd in get_active_account_hwnds(tracked_players).items():
+            try:
+                _tid, pid = win32process.GetWindowThreadProcessId(hwnd)
+            except Exception:
+                continue
+            active[player_name] = pid
+        return active

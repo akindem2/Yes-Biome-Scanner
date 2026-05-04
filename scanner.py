@@ -5,11 +5,23 @@ from datetime import datetime, timezone
 from settings_manager import load_settings
 from webhook import send_webhook_found_message, send_webhook_ended_message, send_start_webhook, send_stop_webhook
 
+import config_snapshot
+
+import perf_log
+from account_runtime import runtime
+
+# ── THREADING NOTES (Phase 1.4 concurrency audit) ──────────────────────────
+# Worker thread: scanner_loop.  Globals shared with UI thread (unprotected):
+#   player_logs    — written by scanner, read by ui._refresh_status()
+#   current_biome  — written by scanner, read by ui._refresh_status()
+#   active_players — written by UI (update_players), read by scanner
+#   player_pslinks — written by UI (update_players), read by scanner
+# GIL makes individual dict gets incidentally safe; compound check-then-act
+# across threads is NOT safe.  Phase 3 migrates all four into AccountRuntime.
+# ─────────────────────────────────────────────────────────────────────────────
 signals = None
 
 # Runtime state
-player_logs = {}
-current_biome = {}
 active_players =[]
 player_pslinks = {}
 scanner_running = False
@@ -86,14 +98,12 @@ def init(sig):
 
 
 def load_runtime_settings():
-    """Load settings.json values used during scanning."""
-    settings = load_settings()
-    general = settings.get("general", {})
-
+    """Read scanning config from the in-memory snapshot — no disk read."""
+    general = config_snapshot.current.get("general", {})
     return {
-        "log_path": general.get("log_path"),
+        "log_path":      general.get("log_path"),
         "scan_interval": general.get("scan_interval", 1),
-        "auto_cleanup": general.get("auto_cleanup", True)
+        "auto_cleanup":  general.get("auto_cleanup", True),
     }
 
 
@@ -105,7 +115,8 @@ def find_player_logs(log_path):
     # OPTIMIZATION: Only sweep the massive Roblox logs folder if a player is MISSING a log
     needs_search = False
     for name in active_players:
-        current_file = player_logs.get(name, {}).get("file")
+        _info = runtime.get_log_info(name)
+        current_file = _info.get("file") if _info else None
         if not current_file or not is_log_active(current_file):
             needs_search = True
             break
@@ -127,7 +138,8 @@ def find_player_logs(log_path):
         pass
 
     for name in active_players:
-        current_file = player_logs.get(name, {}).get("file")
+        current_info = runtime.get_log_info(name)
+        current_file = current_info.get("file") if current_info else None
 
         for path in active_logs:
             # If we hit our currently linked file, it means there are no newer files
@@ -144,13 +156,13 @@ def find_player_logs(log_path):
                 signals.log_message.emit(f"[INFO] {name} is using log: {path}")
                 # Setting pos to 0 forces it to read the entire file history immediately
                 # to catch biomes printed while the game was still loading.
-                player_logs[name] = {"file": path, "pos": 0}
+                runtime.update_log_map(name, file=path, pos=0)
                 break
 
 
-def read_new_lines(player_name, info):
+def read_new_lines(player_name, info: dict):
     """Read new log lines and detect biome changes."""
-    path = info["file"]
+    path     = info["file"]
     last_pos = info["pos"]
 
     try:
@@ -166,31 +178,37 @@ def read_new_lines(player_name, info):
         new_data = f.read()
 
     info["pos"] = size
-
+    runtime.update_log_map(player_name, pos=size)
     found_biome = None
 
     # Each entry: (hoverText as it appears in the log, internal biome name)
     BIOME_DEFINITIONS = [
-        ("SNOWY",       "snowy"),
-        ("RAINY",       "rainy"),
-        ("EGGLAND",     "eggland"),
-        ("WINDY",       "windy"),
-        ("CORRUPTION",  "corruption"),
-        ("HEAVEN",      "heaven"),
-        ("HELL",        "hell"),
-        ("NULL",        "null"),
-        ("GLITCHED",    "glitched"),
-        ("DREAMSPACE",  "dreamspace"),
-        ("SAND STORM",  "sand storm"),
-        ("STARFALL",    "starfall"),
-        ("CYBERSPACE",  "cyberspace"),
-        ("SINGULARITY", "singularity"),
+        # TODO: replace each 0 with the real assetId from the Roblox log.
+        # Until confirmed, search string is {"hoverText":"X","assetId":0}.
+        # If the log writes a non-zero ID, detection silently fails.
+        ("SNOWY",      109912975653138, "snowy"),      # exact log hoverText
+        ("RAINY",      137992545432987, "rainy"),      # exact log hoverText
+        ("EGGLAND",    107114559110957, "eggland"),    # exact log hoverText
+        ("WINDY",      138169499467564, "windy"),      # exact log hoverText
+        ("CORRUPTION", 137622939436355, "corruption"), # exact log hoverText
+        ("HEAVEN",     100160513248702, "heaven"),     # exact log hoverText
+        ("HELL",       89721298978404, "hell"),        # exact log hoverText
+        ("NULL",       120277135407020, "null"),       # exact log hoverText
+        ("GLITCHED",   92180140049616, "glitched"),    # exact log hoverText
+        ("DREAMSPACE", 124768988619166, "dreamspace"), # exact log hoverText
+        ("SAND STORM", 102180669654341, "sand storm"), # exact log hoverText
+        ("STARFALL",   110087292131274, "starfall"),   # exact log hoverText
+        ("CYBERSPACE", 89000537898277, "cyberspace"),  # exact log hoverText
+        ("SINGULARITY", 107114559110957, "singularity"), # exact log hoverText
     ]
 
-    # Format matches the log line: {"hoverText":"[name]",
+
+
+    # Format matches the canonical Roblox log substring exactly:
+    # {"hoverText":"NAME","assetId":ID}
     biome_map = {
-        f'{{"hoverText":"{hover}",': internal
-        for hover, internal in BIOME_DEFINITIONS
+        f'{{"hoverText":"{hover}","assetId":{asset_id}}}': internal
+        for hover, asset_id, internal in BIOME_DEFINITIONS
     }
 
     lines = new_data.splitlines()
@@ -213,6 +231,11 @@ def read_new_lines(player_name, info):
                     pass
 
         line_lower = line
+        # NOTE: "line_lower" is a misnomer — the line is NOT lowercased.
+        # Matching is case-sensitive by design: biome_map keys use the exact
+        # title-case from BIOME_DEFINITIONS ("Snowy", "Sand Storm", etc.),
+        # matching the Roblox log format.  Do NOT add .lower() here.
+
         for search_str, true_biome in biome_map.items():
             if search_str in line_lower:
                 found_biome = true_biome
@@ -232,12 +255,9 @@ def read_new_lines(player_name, info):
     if not found_biome:
         return
 
-    previous = current_biome.get(player_name)
-
+    previous = runtime.update_biome(player_name, found_biome)
     if previous == found_biome:
         return
-
-    current_biome[player_name] = found_biome
 
     if is_old:
         # We found the biome for auto-item state, but it's too old to trigger alerts
@@ -264,7 +284,11 @@ def cleanup_unlinked_logs(log_path):
     if not all_logs:
         return
 
-    linked_logs = {info["file"] for info in player_logs.values()}
+    linked_logs = {
+        entry["file"]
+        for entry in runtime.all_log_entries().values()
+        if entry.get("file")
+    }
     current_time = time.time()
 
     for log in all_logs:
@@ -288,32 +312,43 @@ def scanner_loop():
     """Main scanner thread."""
     global scanner_running
 
-    settings = load_runtime_settings()
-    log_path = settings["log_path"]
-    scan_interval = settings["scan_interval"]
-    auto_cleanup = settings["auto_cleanup"]
-
     try:
         signals.log_message.emit("[START] Scanner thread running")
         send_start_webhook(len(active_players))
         
         while scanner_running:
+            _t0 = time.perf_counter()
+
+            # Log scanning and biome detection are owned entirely by
+            # log_indexer.py.  scanner_loop() only handles health reporting,
+            # optional log cleanup, and the start/stop webhooks.
+            _cfg          = load_runtime_settings()
+            scan_interval = _cfg["scan_interval"]
+            auto_cleanup  = _cfg["auto_cleanup"]
+            log_path      = _cfg["log_path"]
+
             time.sleep(scan_interval)
 
-            find_player_logs(log_path)
+            if auto_cleanup and log_path:
+                with perf_log.timed("cleanup_unlinked_logs", threshold_ms=100):
+                    cleanup_unlinked_logs(log_path)
 
-            if auto_cleanup:
-                cleanup_unlinked_logs(log_path)
+            _elapsed_ms = (time.perf_counter() - _t0) * 1000
+            runtime.update_health("scanner", _elapsed_ms, slow_threshold_ms=500)
 
-            for name, info in list(player_logs.items()):
-                read_new_lines(name, info)
+            
 
         signals.log_message.emit("[STOP] Scanner stopped")
         send_stop_webhook()
 
-    except Exception as e:
+    except Exception:
         import traceback
         traceback.print_exc()
+        signals.log_message.emit("[ERROR] Scanner crashed — see console")
+        signals.scanner_crashed.emit()
+
+    finally:
+        scanner_running = False   # always reset, even on normal stop
 
 
 def start_scanner():
@@ -334,13 +369,40 @@ def stop_scanner():
 
 def update_players(player_dict):
     """Update active players + PS links."""
-    global active_players, player_logs, current_biome, player_pslinks
+    global active_players, player_pslinks
 
     active_players = list(player_dict.keys())
     player_pslinks = player_dict
 
-    # Reset logs + biome state
-    player_logs = {}
-    current_biome = {}
+    # Reset runtime state for the new player set
+    runtime.clear_log_map()
+    runtime.clear_biome_state()
 
     signals.log_message.emit(f"[INFO] Updated players: {active_players}")
+
+def handle_biome_event(player_name: str, payload: dict) -> None:
+    """Called by log_indexer in the indexer thread. Must be fast."""
+    if not scanner_running:
+        return
+    found_biome = payload.get("biome", "")
+    is_old      = payload.get("is_old", False)
+    _player_data = player_pslinks.get(player_name, {})
+    ps_link      = _player_data.get("pslink", "") if isinstance(_player_data, dict) else str(_player_data or "")
+    previous = runtime.update_biome(player_name, found_biome)
+    if previous == found_biome:
+        return
+
+    if is_old:
+        signals.log_message.emit(
+            f"[BIOME] {player_name} resumed in biome: {found_biome} (silenced alert)"
+        )
+        signals.biome_update.emit(player_name, found_biome)
+        return
+
+    if previous:
+        signals.log_message.emit(f"[BIOME] {player_name} biome ended: {previous}")
+        send_webhook_ended_message(previous, player_name)
+
+    signals.log_message.emit(f"[BIOME] {player_name} biome started: {found_biome}")
+    signals.biome_update.emit(player_name, found_biome)
+    send_webhook_found_message(found_biome, player_name, ps_link)

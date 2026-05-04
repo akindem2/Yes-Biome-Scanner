@@ -9,12 +9,11 @@ bes_manager.py — High-level wrapper around BESMultiProcessController for Roblo
 import threading
 import time
 
-import win32gui
-import win32process
-
 import window_utils
 from settings_manager import load_settings
 from bes_limiter import BESMultiProcessController
+
+from account_runtime import runtime
 
 signals = None
 bes_running = False
@@ -24,21 +23,6 @@ _controller: BESMultiProcessController | None = None
 # ----------------------------------------------------------------
 # Window / PID helpers
 # ----------------------------------------------------------------
-def _get_roblox_pid_map() -> dict[int, int]:
-    """Return {pid: hwnd} for every visible Roblox window."""
-    result: dict[int, int] = {}
-
-    def _cb(hwnd, _):
-        try:
-            if win32gui.IsWindowVisible(hwnd) and win32gui.GetWindowText(hwnd) == "Roblox":
-                _, pid = win32process.GetWindowThreadProcessId(hwnd)
-                result[int(pid)] = hwnd
-        except Exception:
-            pass
-        return True
-
-    win32gui.EnumWindows(_cb, None)
-    return result
 
 
 def _get_exempt_pids(exempt_accounts, pid_hwnd_map, name_cache):
@@ -101,64 +85,27 @@ def _bes_loop():
 
             exempt_accts = cfg.get("exempt_accounts", []) or []
 
-            pid_map = _get_roblox_pid_map()
+            # Read window state from runtime — poller keeps it fresh.
+            window_data = runtime.all_windows()
+            # Build pid -> name and pid -> hwnd maps
+            pid_to_name: dict[int, str] = {}
+            for acct_name, entry in window_data.items():
+                pid = entry.get("pid")
+                if pid is not None:
+                    pid_to_name[pid] = acct_name
 
-            now = time.time()
+            exempt_set  = set(exempt_accts)
+            exempt_pids = {pid for pid, nm in pid_to_name.items() if nm in exempt_set}
 
-            # Record first-seen time for any new PIDs.
-            for pid in pid_map:
-                if pid not in _pid_first_seen:
-                    _pid_first_seen[pid] = now
-
-            # Drop stale entries for PIDs that no longer exist.
-            for pid in list(_pid_first_seen):
-                if pid not in pid_map:
-                    _pid_first_seen.pop(pid, None)
-
-            # ── Name resolution (expensive, so batched + cached) ──────────
-            # Only re-resolve when the timer expires OR new PIDs appeared
-            # that aren't in the cache yet.
-            new_pids_unseen = any(pid not in _name_cache for pid in pid_map)
-            if new_pids_unseen or (now - _last_name_resolve >= _NAME_RESOLVE_INTERVAL):
-                try:
-                    tracked = list(settings.get("players", {}).keys())
-                    hwnds = list(pid_map.values())
-                    if hwnds and tracked:
-                        hwnd_names = window_utils.resolve_accounts_for_windows(hwnds, tracked)
-                        # Rebuild cache as {pid: name}
-                        _name_cache.clear()
-                        for pid, hwnd in pid_map.items():
-                            _name_cache[pid] = hwnd_names.get(hwnd)
-                    else:
-                        _name_cache.clear()
-                except Exception:
-                    pass
-                _last_name_resolve = now
-
-            # Purge cache entries for PIDs that are gone.
-            for pid in list(_name_cache):
-                if pid not in pid_map:
-                    _name_cache.pop(pid, None)
-
-            exempt_pids = _get_exempt_pids(exempt_accts, pid_map, _name_cache)
-
-            # Build PID -> reduction percent map (global limit, per-process application)
             target_pcts: dict[int, int] = {}
-            names: dict[int, str] = {}
+            names:       dict[int, str] = {}
 
             if reduce_pct > 0:
-                for pid, hwnd in pid_map.items():
+                for pid, acct_name in pid_to_name.items():
                     if pid in exempt_pids:
                         continue
-
-                    # Skip PIDs that are still within the startup grace period.
-                    age = now - _pid_first_seen.get(pid, now)
-                    if age < grace_seconds:
-                        _controller.hold_unthrottled(pid, grace_seconds - age)
-                        continue
-
                     target_pcts[pid] = reduce_pct
-                    names[pid] = _name_cache.get(pid) or f"PID {pid}"
+                    names[pid]       = acct_name
 
             _controller.apply(target_pcts, names=names)
 
