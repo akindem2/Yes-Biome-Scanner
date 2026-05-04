@@ -130,19 +130,16 @@ def _is_active(path: str, max_age: int = 120) -> bool:
         return False
 
 
-_LOG_HEADER_BYTES = 131_072   # 128 KB — username appears later in some log formats
-
-
 def _username_in_log(path: str, name: str) -> bool:
     """
     Return True if the log file at path belongs to the given player.
-    Reads up to _LOG_HEADER_BYTES and checks for the username both
+    Reads the entire file and checks for the username both
     case-sensitively and case-insensitively, since Roblox log headers
-    vary in casing across versions.
+    vary in casing across versions and username may appear at any point.
     """
     try:
         with open(path, "r", encoding="utf-8", errors="ignore") as f:
-            data = f.read(_LOG_HEADER_BYTES)
+            data = f.read()
     except Exception:
         return False
     name_lower = name.lower()
